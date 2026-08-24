@@ -1,0 +1,368 @@
+# =============================================================================
+# STOAT - stack de producao
+# =============================================================================
+# Precisa apenas deste arquivo e do .env ao lado.
+#
+#   cp .env.example .env && nano .env
+#   docker compose up -d
+#
+# Portas que precisam estar abertas na VPS:
+#   80/tcp, 443/tcp     HTTP + HTTPS (Caddy, certificado automatico)
+#   7881/tcp            fallback TCP do WebRTC
+#   50000-50100/udp     midia RTC (voz/video) - sem isto a voz nao sai
+# =============================================================================
+
+name: stoat
+
+# ---------------------------------------------------------------------------
+# Blocos reutilizados
+# ---------------------------------------------------------------------------
+
+# Segredos e overrides entregues aos servicos do backend.
+# O revolt-config le variaveis com prefixo REVOLT e separador __,
+# e elas vencem qualquer valor do Revolt.toml.
+x-backend-env: &backend-env
+  REVOLT__PUSHD__VAPID__PRIVATE_KEY: ${VAPID_PRIVATE_KEY:?defina VAPID_PRIVATE_KEY no .env}
+  REVOLT__PUSHD__VAPID__PUBLIC_KEY: ${VAPID_PUBLIC_KEY:?defina VAPID_PUBLIC_KEY no .env}
+  REVOLT__FILES__ENCRYPTION_KEY: ${FILES_ENCRYPTION_KEY:?defina FILES_ENCRYPTION_KEY no .env}
+  REVOLT__API__LIVEKIT__NODES__WORLDWIDE__KEY: ${LIVEKIT_KEY:?defina LIVEKIT_KEY no .env}
+  REVOLT__API__LIVEKIT__NODES__WORLDWIDE__SECRET: ${LIVEKIT_SECRET:?defina LIVEKIT_SECRET no .env}
+  REVOLT__RABBIT__USERNAME: ${RABBITMQ_USER}
+  REVOLT__RABBIT__PASSWORD: ${RABBITMQ_PASSWORD:?defina RABBITMQ_PASSWORD no .env}
+  REVOLT__FILES__S3__ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  REVOLT__FILES__S3__SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:?defina MINIO_ROOT_PASSWORD no .env}
+  REVOLT__API__SECURITY__TENOR_KEY: ${TENOR_KEY:-}
+  REVOLT__API__SECURITY__CAPTCHA__HCAPTCHA_KEY: ${HCAPTCHA_KEY:-}
+  REVOLT__API__SECURITY__CAPTCHA__HCAPTCHA_SITEKEY: ${HCAPTCHA_SITEKEY:-}
+  REVOLT__API__SMTP__HOST: ${SMTP_HOST:-}
+  REVOLT__API__SMTP__PORT: ${SMTP_PORT:-587}
+  REVOLT__API__SMTP__USERNAME: ${SMTP_USERNAME:-}
+  REVOLT__API__SMTP__PASSWORD: ${SMTP_PASSWORD:-}
+  REVOLT__API__SMTP__FROM_ADDRESS: ${SMTP_FROM:-noreply@example.com}
+  REVOLT__API__SMTP__REPLY_TO: ${SMTP_REPLY_TO:-}
+  REVOLT__API__REGISTRATION__INVITE_ONLY: ${STOAT_INVITE_ONLY:-false}
+
+x-backend: &backend
+  restart: always
+  environment: *backend-env
+  configs:
+    - source: revolt_toml
+      target: /Revolt.toml
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infraestrutura
+  # ---------------------------------------------------------------------------
+  database:
+    image: docker.io/mongo:8
+    restart: always
+    # Por padrao o WiredTiger reserva ~50% da RAM. Em VPS pequena isso engole
+    # a maquina inteira e o resto da stack comeca a ser morto por OOM.
+    command: mongod --wiredTigerCacheSizeGB ${MONGO_CACHE_GB:-0.25}
+    volumes:
+      - ./data/db:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  redis:
+    image: valkey/valkey:9-alpine
+    restart: always
+    volumes:
+      - ./data/redis:/data
+
+  rabbit:
+    image: docker.io/rabbitmq:4
+    restart: always
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD}
+    volumes:
+      - ./data/rabbit:/var/lib/rabbitmq
+    healthcheck:
+      # `ping` fica saudavel ANTES do listener AMQP aceitar conexoes, o que
+      # faz api/crond/pushd/voice-ingress panicarem em loop no boot.
+      # `check_port_connectivity` so passa quando a 5672 realmente aceita.
+      test: rabbitmq-diagnostics -q check_port_connectivity
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 30s
+
+  minio:
+    image: docker.io/minio/minio
+    restart: always
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DOMAIN: minio
+    volumes:
+      - ./data/minio:/data
+    networks:
+      default:
+        aliases:
+          - revolt-uploads.minio
+
+  createbuckets:
+    image: docker.io/minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      while ! /usr/bin/mc ready minio; do
+        /usr/bin/mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
+        echo 'Waiting minio...' && sleep 1;
+      done;
+      /usr/bin/mc mb --ignore-existing minio/revolt-uploads;
+      exit 0;
+      "
+
+  livekit:
+    image: ghcr.io/stoatchat/livekit-server:v1.9.13
+    restart: always
+    depends_on:
+      redis:
+        condition: service_started
+    command: --config /etc/livekit.yml
+    ports:
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    configs:
+      - source: livekit_yml
+        target: /etc/livekit.yml
+
+  # ---------------------------------------------------------------------------
+  # Reverse proxy (HTTPS automatico)
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: docker.io/caddy:2-alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./data/caddy-data:/data
+      - ./data/caddy-config:/config
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+      - source: stoat_json
+        target: /stoat.json
+
+  # ---------------------------------------------------------------------------
+  # Backend
+  # ---------------------------------------------------------------------------
+  api:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-api:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      redis: { condition: service_started }
+      rabbit: { condition: service_healthy }
+
+  events:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-events:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  autumn:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-file-server:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      createbuckets: { condition: service_started }
+
+  january:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-proxy:${STOAT_TAG}
+
+  gifbox:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-gifbox:${STOAT_TAG}
+
+  crond:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-crond:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      minio: { condition: service_started }
+      # crond publica no AMQP; sem esperar o rabbit ele panica em
+      # amqp.rs:62 e fica em restart-loop ate o rabbit aceitar conexao.
+      rabbit: { condition: service_healthy }
+
+  pushd:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-pushd:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      redis: { condition: service_started }
+      rabbit: { condition: service_healthy }
+
+  voice-ingress:
+    <<: *backend
+    image: ${STOAT_REGISTRY}/stoat-voice-ingress:${STOAT_TAG}
+    depends_on:
+      database: { condition: service_healthy }
+      rabbit: { condition: service_healthy }
+
+  # ---------------------------------------------------------------------------
+  # Frontend
+  # ---------------------------------------------------------------------------
+  web:
+    image: ${STOAT_REGISTRY}/stoat-web:${STOAT_TAG}
+    restart: always
+    environment:
+      # A imagem e agnostica de dominio: o build usa placeholders e o
+      # docker/inject.js substitui no start do container.
+      VITE_HOST: ${STOAT_DOMAIN}
+      VITE_API_URL: https://${STOAT_DOMAIN}/api
+
+# =============================================================================
+# Configuracoes embutidas - nada de arquivos extras para copiar
+# =============================================================================
+configs:
+  # ---------------------------------------------------------------------------
+  caddyfile:
+    content: |
+      ${STOAT_DOMAIN} {
+      	tls ${ACME_EMAIL}
+
+      	route /.well-known/stoat {
+      		uri strip_prefix /.well-known/stoat
+      		header {
+      			Access-Control-Allow-Origin *
+      		}
+      		file_server {
+      			root /stoat.json
+      		}
+      	}
+
+      	route /api* {
+      		uri strip_prefix /api
+      		reverse_proxy http://api:14702 {
+      			header_down Location "^/" "/api/"
+      		}
+      	}
+
+      	route /ws {
+      		uri strip_prefix /ws
+      		reverse_proxy http://events:14703
+      	}
+
+      	route /autumn* {
+      		uri strip_prefix /autumn
+      		reverse_proxy http://autumn:14704 {
+      			header_down Location "^/" "/autumn/"
+      		}
+      	}
+
+      	route /january* {
+      		uri strip_prefix /january
+      		reverse_proxy http://january:14705 {
+      			header_down Location "^/" "/january/"
+      		}
+      	}
+
+      	route /gifbox* {
+      		uri strip_prefix /gifbox
+      		reverse_proxy http://gifbox:14706 {
+      			header_down Location "^/" "/gifbox/"
+      		}
+      	}
+
+      	route /livekit* {
+      		uri strip_prefix /livekit
+      		reverse_proxy http://livekit:7880
+      	}
+
+      	route /ingress* {
+      		uri strip_prefix /ingress
+      		reverse_proxy http://voice-ingress:8500
+      	}
+
+      	reverse_proxy http://web:5000
+      }
+
+  # ---------------------------------------------------------------------------
+  revolt_toml:
+    content: |
+      # Gerado pelo docker-compose.yml. Segredos vem por variavel de ambiente
+      # (REVOLT__SECAO__CHAVE), que sempre vence o valor daqui.
+      production = true
+
+      [hosts]
+      app = "https://${STOAT_DOMAIN}"
+      api = "https://${STOAT_DOMAIN}/api"
+      events = "wss://${STOAT_DOMAIN}/ws"
+      autumn = "https://${STOAT_DOMAIN}/autumn"
+      january = "https://${STOAT_DOMAIN}/january"
+      gifbox = "https://${STOAT_DOMAIN}/gifbox"
+
+      [hosts.livekit]
+      worldwide = "wss://${STOAT_DOMAIN}/livekit"
+
+      [api.livekit.nodes.worldwide]
+      url = "http://livekit:7880"
+      lat = 0.0
+      lon = 0.0
+
+      [files.s3]
+      endpoint = "http://minio:9000"
+      path_style_buckets = false
+      region = "minio"
+      default_bucket = "revolt-uploads"
+
+      [features]
+      webhooks_enabled = true
+
+      [features.limits.global]
+      # Allowlist de quem pode CRIAR servidor.
+      #   []                -> qualquer um cria
+      #   ["<id>", "<id>"]  -> SO esses ids criam; os demais recebem
+      #                        CantCreateServers (server_create.rs:29-39)
+      # Nao afeta entrar em servidor por convite.
+      restrict_server_creation = ${STOAT_SERVER_CREATORS:-[]}
+
+      [features.limits.new_user]
+      video_resolution = [1920, 1080]
+      video_aspect_ratio = [0.3, 10]
+
+      [features.limits.default]
+      video_resolution = [1920, 1080]
+      video_aspect_ratio = [0.3, 10]
+
+  # ---------------------------------------------------------------------------
+  livekit_yml:
+    content: |
+      rtc:
+        use_external_ip: true
+        port_range_start: 50000
+        port_range_end: 50100
+        tcp_port: 7881
+        node_ip: "${LIVEKIT_NODE_IP:-}"
+
+      redis:
+        address: redis:6379
+
+      turn:
+        enabled: false
+
+      keys:
+        ${LIVEKIT_KEY}: ${LIVEKIT_SECRET}
+
+      webhook:
+        api_key: ${LIVEKIT_KEY}
+        urls:
+        - "http://voice-ingress:8500/worldwide"
+
+  # ---------------------------------------------------------------------------
+  stoat_json:
+    content: |
+      {"api":"https://${STOAT_DOMAIN}/api"}
