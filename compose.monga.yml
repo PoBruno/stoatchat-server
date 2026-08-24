@@ -62,7 +62,7 @@ services:
     volumes:
       - ./data/db:/data/db
     healthcheck:
-      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      test: ["CMD-SHELL", "mongoexport --host localhost:27017 --db admin --collection system.version --limit 1 --quiet"]
       interval: 10s
       timeout: 10s
       retries: 5
