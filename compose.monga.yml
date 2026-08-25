@@ -42,6 +42,21 @@ x-backend-env: &backend-env
   REVOLT__API__SMTP__REPLY_TO: ${SMTP_REPLY_TO:-}
   REVOLT__API__REGISTRATION__INVITE_ONLY: ${STOAT_INVITE_ONLY:-false}
 
+  # MusicBox: musica dentro da chamada.
+  #
+  # O YouTube recusa o IP desta VPS, entao quem extrai o audio e um agente
+  # numa conexao residencial. Ele vive atras de NAT: e sempre ele quem procura
+  # o servidor, e o audio vai da casa dele direto para o LiveKit -- esta
+  # maquina nunca ve um byte de musica.
+  #
+  # Segredo vazio desliga o recurso.
+  #
+  # O bot daria nome e rosto ao MusicBox na chamada. Deixamos de proposito
+  # vazio: sem ele o agente toca sem entrar na lista de participantes, e a
+  # musica soa como se viesse do canal em vez de uma pessoa a mais.
+  REVOLT__MUSICBOX__AGENT_SECRET: ${MUSICBOX_SECRET:-}
+  REVOLT__MUSICBOX__BOT_USER_ID: ${MUSICBOX_BOT_ID:-}
+
 x-backend: &backend
   restart: always
   environment: *backend-env
@@ -223,6 +238,7 @@ services:
       # docker/inject.js substitui no start do container.
       VITE_HOST: ${STOAT_DOMAIN}
       VITE_API_URL: https://${STOAT_DOMAIN}/api
+      VITE_DEV_GIFBOX_URL: ${STOAT_GIFBOX_URL:-}
 
 # =============================================================================
 # Configuracoes embutidas - nada de arquivos extras para copiar
