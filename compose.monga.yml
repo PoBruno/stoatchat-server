@@ -7,9 +7,9 @@
 #   docker compose up -d
 #
 # Portas que precisam estar abertas na VPS:
-#   80/tcp, 443/tcp     HTTP + HTTPS (Caddy, certificado automatico)
+#   80/tcp              HTTP puro (TLS fica no Traefik da VPS)
 #   7881/tcp            fallback TCP do WebRTC
-#   50000-50100/udp     midia RTC (voz/video) - sem isto a voz nao sai
+#   50000/udp           midia RTC (voz/video) - sem isto a voz nao sai
 # =============================================================================
 
 name: stoat
@@ -34,6 +34,11 @@ x-backend-env: &backend-env
   REVOLT__API__SECURITY__TENOR_KEY: ${TENOR_KEY:-}
   REVOLT__API__SECURITY__CAPTCHA__HCAPTCHA_KEY: ${HCAPTCHA_KEY:-}
   REVOLT__API__SECURITY__CAPTCHA__HCAPTCHA_SITEKEY: ${HCAPTCHA_SITEKEY:-}
+  # A porta 587 e de texto puro com negociacao depois (STARTTLS). Sem
+  # isto o backend abre TLS direto e o servidor responde com lixo, que
+  # aparece como "wrong version number" -- erro que parece de
+  # certificado e e de protocolo.
+  REVOLT__API__SMTP__USE_STARTTLS: "true"
   REVOLT__API__SMTP__HOST: ${SMTP_HOST:-}
   REVOLT__API__SMTP__PORT: ${SMTP_PORT:-587}
   REVOLT__API__SMTP__USERNAME: ${SMTP_USERNAME:-}
@@ -145,7 +150,7 @@ services:
     command: --config /etc/livekit.yml
     ports:
       - "7881:7881"
-      - "50000-50100:50000-50100/udp"
+      - "50000:50000/udp"
     configs:
       - source: livekit_yml
         target: /etc/livekit.yml
@@ -158,8 +163,6 @@ services:
     restart: always
     ports:
       - "80:80"
-      - "443:443"
-      - "443:443/udp"
     volumes:
       - ./data/caddy-data:/data
       - ./data/caddy-config:/config
@@ -231,6 +234,9 @@ services:
   # Frontend
   # ---------------------------------------------------------------------------
   web:
+    # Build do fork (for-web feat/sync-upstream-0.17, 2026-11-21); o fix do
+    # Titlebar (tela preta do desktop) ja esta nele.
+    # Rollback: image: stoat-web:hotfix-titlebar
     image: ${STOAT_REGISTRY}/stoat-web:${STOAT_TAG}
     restart: always
     environment:
@@ -243,12 +249,54 @@ services:
 # =============================================================================
 # Configuracoes embutidas - nada de arquivos extras para copiar
 # =============================================================================
+  # ---------------------------------------------------------------------------
+  # MusicBox: agente de extracao
+  # ---------------------------------------------------------------------------
+  #
+  # Mora AQUI, junto da stack, e nao mais num CT separado. O motivo de ele ter
+  # nascido fora era o IP: o YouTube recusa endereco de datacenter, e a VPS
+  # antiga era datacenter. Agora o Stoat roda em casa, numa conexao
+  # residencial, entao o agente pode ficar ao lado -- some um CT inteiro e o
+  # ponto de falha silencioso que ele representava.
+  #
+  # `network_mode: host` e obrigatorio: a midia RTC nao atravessa mapeamento
+  # de porta. Em LXC isso e a rede do proprio CT, nao a do Proxmox.
+  musicbox-agent:
+    image: musicbox-agent:local
+    restart: unless-stopped
+    network_mode: host
+    # O node e o PID 1 do container e nao recolhe filhos: healthcheck que
+    # estoura o timeout vira zumbi. `init` poe um tini na frente.
+    init: true
+    # /tmp EM MEMORIA, e isto nao e detalhe. O yt-dlp autonomo (PyInstaller)
+    # extrai ~40 MB de Python em /tmp a CADA execucao e apaga ao sair. Com
+    # /tmp no disco foram ~2,8 MB/s de escrita continua no HDD do pool `data`
+    # (327 GB em 36 h, 2026-11-12). O `exec` e obrigatorio: sem ele o yt-dlp
+    # falha com "failed to map segment". HOME=/tmp na imagem, entao o cache
+    # do yt-dlp tambem fica aqui.
+    tmpfs:
+      - /tmp:size=256m,exec
+    # Extracao e rajada curta; o teto impede uma faixa problematica de comer
+    # a RAM do CT inteiro.
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    environment:
+      STOAT_URL: http://127.0.0.1/api
+      AGENTE_SEGREDO: ${MUSICBOX_SECRET}
+      PORTA: 7700
+      ATUALIZAR_YTDLP: "true"
+    depends_on:
+      - api
+
 configs:
   # ---------------------------------------------------------------------------
   caddyfile:
     content: |
-      ${STOAT_DOMAIN} {
-      	tls ${ACME_EMAIL}
+      # Atras do Pangolin: o Traefik da VPS termina TLS, entao aqui
+      # e HTTP puro. Pedir certificado por dentro do tunel falharia.
+      :80 {
 
       	route /.well-known/stoat {
       		uri strip_prefix /.well-known/stoat
@@ -358,11 +406,16 @@ configs:
   livekit_yml:
     content: |
       rtc:
-        use_external_ip: true
-        port_range_start: 50000
-        port_range_end: 50100
+        # Atras do Pangolin o LiveKit NAO pode descobrir o proprio IP: ele
+        # acharia o IP publico de casa, e os clientes chegam pela VPS.
+        # Anunciar o endereco errado faz o sinal conectar e a midia nunca
+        # passar -- o sintoma e "Conectando..." para sempre.
+        use_external_ip: false
+        node_ip: "${LIVEKIT_NODE_IP}"
+        # Porta UDP unica em vez da faixa 50000-50100: a faixa viraria 101
+        # regras no Pangolin. Uma porta atende dezenas de participantes.
+        udp_port: 50000
         tcp_port: 7881
-        node_ip: "${LIVEKIT_NODE_IP:-}"
 
       redis:
         address: redis:6379
